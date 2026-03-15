@@ -9,7 +9,9 @@
       "Bash(cp -r src public astro.config.mjs tsconfig.json package.json apps/webapp/)",
       "Bash(pnpm install:*)",
       "Bash(pnpm approve-builds:*)",
-      "Bash(printf '\\\\x03')"
+      "Bash(printf '\\\\x03')",
+      "Bash(pnpm db:generate)",
+      "Bash(timeout 8 pnpm dev)"
     ]
   }
 }

@@ -1,14 +1,7 @@
-import type { ExpenseSummary } from '../services/expenses'
-import type { Category } from '../services/categories'
 import type { AuthUser } from '../services/auth'
 
 const USER_KEY = 'expenser-user'
 const HOME_KEY = 'expenser-home'
-
-export interface HomeCache {
-  summary: ExpenseSummary
-  categories: Category[]
-}
 
 function read<T>(key: string): T | null {
   if (typeof localStorage === 'undefined') return null
@@ -35,14 +28,6 @@ export function readUserCache(): AuthUser | null {
 
 export function writeUserCache(user: AuthUser): void {
   write(USER_KEY, user)
-}
-
-export function readHomeCache(): HomeCache | null {
-  return read<HomeCache>(HOME_KEY)
-}
-
-export function writeHomeCache(data: HomeCache): void {
-  write(HOME_KEY, data)
 }
 
 /** Wipe all cached account data — call on logout or when auth is rejected. */

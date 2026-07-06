@@ -1,6 +1,7 @@
 # Expenser Web App
 
-A weekly expense tracker for managing personal budgets in Argentine Pesos (ARS). Full-stack TypeScript monorepo.
+A weekly/monthly expense tracker for managing personal budgets in Argentine Pesos (ARS), with
+per-user accounts. Full-stack TypeScript monorepo.
 
 ## Monorepo Structure
 
@@ -9,8 +10,9 @@ A weekly expense tracker for managing personal budgets in Argentine Pesos (ARS).
 ```
 expenser/
 ├── apps/
-│   ├── backend/    # Fastify REST API + Prisma + SQLite
-│   └── webapp/     # Astro + React + Tailwind CSS
+│   ├── backend/    # Fastify REST API + Prisma + SQLite (libSQL/Turso adapter)
+│   └── webapp/     # Astro + React + Tailwind CSS (installable PWA)
+├── cloudbuild.yaml # Cloud Build config for the backend Docker image
 ├── turbo.json
 ├── pnpm-workspace.yaml
 └── package.json
@@ -22,34 +24,39 @@ expenser/
 |---|---|
 | `pnpm dev` | Start both apps in dev mode |
 | `pnpm build` | Build both apps for production |
-| `pnpm db:generate` | Generate Prisma Client |
-| `pnpm --filter @expenser/backend db:migrate` | Run DB migrations |
-| `pnpm --filter @expenser/backend dev` | Backend only |
-| `pnpm --filter @expenser/webapp dev` | Webapp only |
+| `pnpm --filter @expenser/backend db:generate` | Generate Prisma Client |
+| `pnpm --filter @expenser/backend db:migrate` | Run DB migrations (local dev) |
+| `pnpm --filter @expenser/backend dev` | Backend only (`http://localhost:3001`) |
+| `pnpm --filter @expenser/webapp dev` | Webapp only (`http://localhost:4321`) |
 
 ---
 
 ## Backend (`apps/backend`)
 
-**Stack:** Fastify 5, Prisma 6, SQLite, TypeScript 5 (ESM, strict)
+**Stack:** Fastify 5, Prisma 6 (libSQL driver adapter), SQLite/Turso, TypeScript 5 (ESM, strict), bcrypt for password hashing
 
 - Dev: `tsx watch src/server.ts`
 - Build: `tsup` → `dist/server.js` (ESM)
-- Server runs on `http://localhost:3001`
+- Server runs on `http://localhost:3001` (Cloud Run injects `PORT`, defaults to `8080` there)
 
 ### Source structure
 
 ```
 src/
 ├── server.ts               # Entry point
-├── app.ts                  # Fastify factory, registers CORS + controllers
+├── app.ts                  # Fastify factory: cors, cookie, correlation/logger/auth plugins, controllers
 ├── lib/
-│   ├── prisma.ts           # Prisma Client singleton
-│   └── prisma-errors.ts    # isNotFound(err) utility
+│   ├── env.ts               # process.env reads, centralized (port, webappUrl, cookie settings, databaseUrl)
+│   ├── prisma.ts             # Prisma Client singleton, wired to the libSQL driver adapter
+│   ├── prisma-errors.ts      # isNotFound(err) utility (Prisma P2025)
+│   ├── auth-plugin.ts        # Decorates req.user from the session cookie; exports requireAuth preHandler
+│   ├── correlation-plugin.ts # Reads/generates x-correlation-id, echoes it on the response
+│   └── logger-plugin.ts      # Colored one-line request log; dumps full request/error context on 5xx
 └── modules/
     ├── health/
-    ├── categories/
-    └── expenses/
+    ├── auth/          # signup/login/logout/me, session cookie issuance
+    ├── categories/    # per-user categories
+    └── expenses/      # per-user expenses + weekly/monthly summary
 ```
 
 ### Module pattern
@@ -61,19 +68,22 @@ Each feature module has three files:
 - **`*.types.ts`** — domain interfaces and request/response body types
 
 ```typescript
-// Controller
+// Controller — non-auth modules add requireAuth as a module-wide preHandler hook
 export async function categoriesController(app: FastifyInstance) {
-  app.get('/categories', async () => service.getAll())
-  app.post<{ Body: CreateCategoryRequest }>('/categories', async (req, reply) => {
-    const category = await service.create(req.body)
+  app.addHook('preHandler', requireAuth)
+  app.get('/categories', async (req) => service.getAll(req.user!.id))
+  app.post<{ Body: CreateCategoryBody }>('/categories', async (req, reply) => {
+    const category = await service.create(req.user!.id, req.body)
     return reply.status(201).send(category)
   })
 }
 
-// Service
+// Service — every query is scoped by userId
 export class CategoriesService {
-  getAll() { return prisma.category.findMany() }
-  create(data: CreateCategoryBody) { return prisma.category.create({ data }) }
+  getAll(userId: number) { return prisma.category.findMany({ where: { userId } }) }
+  create(userId: number, data: CreateCategoryBody) {
+    return prisma.category.create({ data: { ...data, userId } })
+  }
 }
 ```
 
@@ -81,37 +91,76 @@ export class CategoriesService {
 - Use `isNotFound(err)` from `lib/prisma-errors.ts` to detect Prisma P2025 errors
 - All imports use `.js` extension (ESM requirement)
 - Register new controllers in `app.ts` with `app.register(myController)`
+- New modules that store user data should add `app.addHook('preHandler', requireAuth)` and scope
+  every Prisma query by `req.user!.id`
+
+### Authentication
+
+Session-based auth using an httpOnly cookie (`session_id`), not JWTs.
+
+- `auth-plugin.ts` runs on every request: reads the cookie, loads the session + user from the DB,
+  and sets `req.user` (`SessionUser | null`). Nothing is auto-rejected — routes opt in via `requireAuth`.
+- `requireAuth` (exported from `lib/auth-plugin.ts`) is a `preHandler` that 401s if `req.user` is null.
+  Every module except `health` and the `signup`/`login` routes uses it.
+- Sessions live in the `Session` table (30-day expiry), created on signup/login, deleted on logout
+  or lazily on expiry check.
+- Passwords are hashed with bcrypt (cost 10). Signup validates name/email/password/allowance and
+  seeds 5 starter categories (Food, Transport, Entertainment, Bills, Other) for the new user.
+- Cookie flags (`SESSION_COOKIE_SECURE`, `SESSION_COOKIE_SAMESITE`) come from `lib/env.ts` — set
+  `secure=true` and `sameSite=none` when the API and webapp are on different origins in production.
+- `AuthError` (with an HTTP `status`) is the module's error type; controllers catch it and forward
+  the status/message, otherwise rethrow.
 
 ### API routes
 
-| Method | Path | Description |
-|---|---|---|
-| GET | `/health` | Health check |
-| GET | `/categories` | List all categories |
-| POST | `/categories` | Create category |
-| PATCH | `/categories/:id` | Update category |
-| DELETE | `/categories/:id` | Delete category (204) |
-| GET | `/expenses` | List all expenses |
-| GET | `/expenses/summary` | Weekly summary (allowance, spent, available, expenses) |
-| GET | `/expenses/:id` | Single expense |
-| POST | `/expenses` | Create expense (body: `{ amount, description, categoryId }`) |
-| PATCH | `/expenses/:id` | Update expense |
-| DELETE | `/expenses/:id` | Delete expense (204) |
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/health` | — | Health check |
+| POST | `/auth/signup` | — | Create account, seed starter categories, start session |
+| POST | `/auth/login` | — | Start session |
+| POST | `/auth/logout` | required | Destroy session |
+| GET | `/auth/me` | required | Current user |
+| PATCH | `/auth/me` | required | Update name / `expendableAmountPerWeek` |
+| GET | `/categories` | required | List categories for the current user |
+| GET | `/categories/:id` | required | Single category |
+| POST | `/categories` | required | Create category |
+| PATCH | `/categories/:id` | required | Update category |
+| DELETE | `/categories/:id` | required | Delete category (204) |
+| GET | `/expenses` | required | List all expenses for the current user |
+| GET | `/expenses/summary` | required | Weekly + monthly summary (allowance, spent, available, expenses) |
+| GET | `/expenses/:id` | required | Single expense |
+| POST | `/expenses` | required | Create expense (body: `{ amount, description, categoryId }`) |
+| PATCH | `/expenses/:id` | required | Update expense |
+| DELETE | `/expenses/:id` | required | Delete expense (204) |
 
-**Weekly summary:** week starts Monday, base allowance is 100,000 ARS (hardcoded in `ExpensesService`).
+**Weekly/monthly summary (`ExpensesService.getWeeklySummary`):**
+- The week "starts" on the most recent **Saturday** (see `getCurrentWeekStart` in
+  `expenses.service.ts`) — not Monday.
+- The allowance is **per-user**: `User.expendableAmountPerWeek`, set at signup and editable via
+  `PATCH /auth/me`. There is no hardcoded global allowance.
+- The response also includes a `monthly` block (calendar month to date): allowance is derived as
+  `(weekly allowance / 7) * daysInMonth`, spent is aggregated from expenses in the current month.
 
-### Environment (`.env`)
+### Environment (`.env`, see `.env.example`)
 
 ```
-DATABASE_URL="file:./dev.db"
+DATABASE_URL="file:./dev.db"        # Prisma CLI (migrate/generate)
+TURSO_DATABASE_URL="file:./prisma/dev.db"  # Runtime connection (libSQL adapter); libsql://... in prod
+TURSO_AUTH_TOKEN=                   # Required only for remote (libsql://) databases
 PORT=3001
+WEBAPP_URL=http://localhost:4321    # Allowed CORS origin
+SESSION_COOKIE_SECURE=false         # true in production (HTTPS-only cookies)
+SESSION_COOKIE_SAMESITE=lax         # "none" if API and webapp are cross-site (requires secure=true)
 ```
+
+`lib/prisma.ts` always goes through the `@prisma/adapter-libsql` driver adapter — locally it points
+at the same SQLite file the Prisma CLI uses; in production it points at a Turso `libsql://` URL.
 
 ---
 
 ## Webapp (`apps/webapp`)
 
-**Stack:** Astro 6, React 19, Tailwind CSS 4, TypeScript (extends Astro strict config)
+**Stack:** Astro 6, React 19, Tailwind CSS 4, TypeScript (extends Astro strict config), installable PWA (`@vite-pwa/astro`)
 
 - Dev: `astro dev` → `http://localhost:4321`
 - Build: `astro build` → `dist/`
@@ -121,25 +170,40 @@ PORT=3001
 ```
 src/
 ├── pages/
-│   ├── index.astro         # Route: /
-│   └── settings.astro      # Route: /settings
+│   ├── index.astro         # Route: / (home, requires auth client-side)
+│   ├── login.astro          # Route: /login
+│   ├── signup.astro         # Route: /signup
+│   ├── settings.astro       # Route: /settings
+│   └── 404.astro
 ├── layouts/
-│   └── Layout.astro        # Base HTML shell
+│   └── Layout.astro        # Base HTML shell; registers the PWA service worker in prod
 ├── components/
-│   └── Header.tsx          # Shared nav header
+│   ├── Header.tsx          # Shared nav header (shows user name, settings/home toggle, logout)
+│   └── HomeSkeleton.tsx    # HeaderSkeleton / HomeSkeleton loading placeholders
 ├── renderers/
-│   ├── HomePage.tsx        # Fetches data, owns page state
-│   └── SettingsPage.tsx
+│   ├── HomePage.tsx        # Fetches summary+categories once authed, owns page state
+│   ├── SettingsPage.tsx
+│   ├── LoginPage.tsx        # Redirects to / if already authed, else renders LoginForm
+│   └── SignupPage.tsx
 ├── templates/
-│   ├── ExpenseTracker.tsx  # Main expense UI + form
-│   └── SettingsScreen.tsx  # Settings UI
+│   ├── ExpenseTracker.tsx  # Main expense UI: weekly balance card, monthly overview, form, list
+│   ├── SettingsScreen.tsx  # Profile (name/allowance) + category editor
+│   ├── LoginForm.tsx
+│   └── SignupForm.tsx
 ├── services/
-│   ├── expenses.ts         # API calls: getExpenseSummary, createExpense, deleteExpense
-│   └── categories.ts       # API calls: getCategories, createCategory, deleteCategory
+│   ├── auth.ts              # signup, login, logout, getCurrentUser, updateProfile
+│   ├── expenses.ts          # getExpenses, getExpenseSummary, createExpense, deleteExpense
+│   └── categories.ts        # getCategories, createCategory, deleteCategory
+├── lib/
+│   ├── apiFetch.ts           # fetch wrapper: prefixes backendUrl, adds x-correlation-id, credentials:'include', console-logs each request
+│   ├── useAuth.ts            # React hook: shows cached user immediately, revalidates via /auth/me, redirects to /login if unauthenticated
+│   ├── cache.ts              # localStorage cache of the current user, used by useAuth for instant paint
+│   └── data.ts               # formatARS(), randomHexColor()/HEX_COLOR_PALETTE (still used); the
+│                              # rest of this file (loadConfig/saveConfig/loadWeekData/getMondayOf/
+│                              # BASE_ALLOWANCE/DEFAULT_CATEGORIES) is unused legacy local-storage
+│                              # code from before the backend existed — don't build on it
 ├── config/
 │   └── environment.ts      # Exports env.backendUrl
-├── lib/
-│   └── data.ts             # formatARS(), localStorage helpers, local types
 └── styles/
     └── global.css          # @import "tailwindcss"
 ```
@@ -150,7 +214,7 @@ src/
 Astro page (.astro)
   └── Renderer (client:load React) — fetches data, manages state
         └── Template — receives data as props, handles UI + form submission
-              └── Components (Header, etc.)
+              └── Components (Header, HomeSkeleton, etc.)
 ```
 
 Astro pages hydrate renderers with `client:load`:
@@ -160,9 +224,21 @@ Astro pages hydrate renderers with `client:load`:
 </Layout>
 ```
 
+### Auth flow
+
+- No route guarding at the Astro/SSG level (the site is static) — each protected renderer uses
+  `useAuth()` (or an inline `getCurrentUser()` check on `/login` and `/signup`) and redirects via
+  `window.location.href`.
+- `useAuth()` paints the last-known user from `localStorage` (via `cache.ts`) immediately, then
+  calls `GET /auth/me` to revalidate. On a confirmed 401 it clears the cache and redirects to
+  `/login`; on a network error it keeps showing the cached user if there is one.
+- `Header`'s logout button calls `POST /auth/logout`, clears the cache, and redirects to `/login`.
+
 ### Service layer
 
-All API calls live in `src/services/`. They use `env.backendUrl` as the base URL and throw on non-ok responses.
+All API calls live in `src/services/` and go through `apiFetch` (`src/lib/apiFetch.ts`), which
+prefixes `env.backendUrl`, always sends `credentials: 'include'` (needed for the session cookie),
+attaches a generated `x-correlation-id` header, and logs each request/response to the console.
 
 ```typescript
 // expenses.ts
@@ -173,7 +249,7 @@ export async function createExpense(payload: {
 }): Promise<Expense>
 
 export async function deleteExpense(id: number): Promise<void>
-export async function getExpenseSummary(): Promise<ExpenseSummary>
+export async function getExpenseSummary(): Promise<ExpenseSummary> // includes `monthly` block
 ```
 
 ### Styling
@@ -201,13 +277,58 @@ set cache headers, invalidate CDN). The app is multi-page SSG; the bucket uses
 
 ---
 
+## Backend deployment
+
+The backend runs on **GCP Cloud Run**, database on **Turso** (hosted libSQL). Manual deploys only,
+no CI/CD. Config lives in `apps/backend/.env.deploy` (project, region, Artifact Registry repo,
+service name); `apps/backend/deploy.sh` reads it, builds the image via Cloud Build
+(`cloudbuild.yaml`, using the repo root as build context so the pnpm workspace resolves), and
+rolls out a new Cloud Run revision.
+
+- Redeploy: `pnpm --filter @expenser/backend deploy` (i.e. `bash apps/backend/deploy.sh`)
+- Image build: `apps/backend/Dockerfile` — multi-stage (`node:24-slim`), installs the pnpm
+  workspace scoped to the backend, runs `prisma generate` twice (once at build, once again inside
+  the pruned `--prod` deploy output so the engine binary matches that node_modules tree), runs as
+  the unprivileged `node` user, listens on `PORT` (Cloud Run sets `8080`).
+- Prisma can't `migrate deploy` against a remote `libsql://` URL — apply schema changes to Turso as
+  raw SQL: `pnpm --filter @expenser/backend db:turso:sql | turso db shell expenser`.
+- Env vars live on the Cloud Run service, not the image — update without rebuilding via
+  `gcloud run services update`.
+- See README "Deployment" for the full one-time setup and endpoint details.
+
+---
+
 ## Database Schema
 
 ```prisma
+model User {
+  id                      Int        @id @default(autoincrement())
+  name                    String
+  email                   String     @unique
+  passwordHash            String
+  expendableAmountPerWeek Float
+  role                    String     @default("user")
+  createdAt               DateTime   @default(now())
+  updatedAt               DateTime   @updatedAt
+  sessions                Session[]
+  categories              Category[]
+  expenses                Expense[]
+}
+
+model Session {
+  id        String   @id
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
 model Category {
-  id    Int    @id @default(autoincrement())
-  name  String
-  color String
+  id     Int    @id @default(autoincrement())
+  name   String
+  color  String
+  userId Int
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
 model Expense {
@@ -217,10 +338,17 @@ model Expense {
   category    String   // Denormalized: stores name, not a FK
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
+  userId      Int
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 ```
 
-**Design note:** `Expense.category` stores the category name as a string (no foreign key). The controller resolves `categoryId` → `category.name` at write time. This means deleting a category does not affect existing expenses.
+**Design notes:**
+- `Expense.category` stores the category name as a string (no foreign key to `Category`). The
+  controller resolves `categoryId` → `category.name` at write time. Deleting a category does not
+  affect existing expenses.
+- Every `Category`/`Expense`/`Session` row is scoped to a `User` via `userId` with cascade delete —
+  deleting a user wipes their categories, expenses, and sessions.
 
 ---
 
